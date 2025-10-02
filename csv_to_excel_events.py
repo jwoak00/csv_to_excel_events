@@ -666,19 +666,26 @@ def aggregate(df: pd.DataFrame, camera_index: Optional[CameraIndex]) -> pd.DataF
 
 def write_by_month(out_df: pd.DataFrame, xlsx_path: str):
     out_df_sorted = out_df.sort_values(by=["_source_file", "Num_event"]).copy()
-    months_present = sorted(
-        {int(m) for m in out_df_sorted["_month"] if isinstance(m, numbers.Integral)}
-    )
-    others_mask = ~out_df_sorted["_month"].apply(lambda x: isinstance(x, numbers.Integral))
-    others_df = out_df_sorted[others_mask]
+
+    def _group_name(month_value: Any) -> str:
+        if isinstance(month_value, numbers.Integral):
+            month = int(month_value)
+            if month in (6, 7):
+                return "6-7월"
+            if month in (8, 9):
+                return "8-9월"
+        return "기타"
+
+    group_labels = out_df_sorted["_month"].apply(_group_name)
+    sheet_order = ["6-7월", "8-9월", "기타"]
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        for mm in months_present:
-            sheet = f"{mm:02d}월"
-            tmp = out_df_sorted[out_df_sorted["_month"] == mm].drop(columns=["_month"])
-            tmp.to_excel(writer, sheet_name=sheet, index=False)
-        if len(others_df) > 0:
-            others_df.drop(columns=["_month"]).to_excel(writer, sheet_name="기타", index=False)
+        for sheet in sheet_order:
+            sheet_df = out_df_sorted[group_labels == sheet]
+            if sheet_df.empty:
+                continue
+            sheet_df = sheet_df.drop(columns=["_month"], errors="ignore")
+            sheet_df.to_excel(writer, sheet_name=sheet, index=False)
 
 
 def build_output_path(input_csv: str, output_dir: str) -> str:
@@ -699,8 +706,8 @@ def convert(input_csv: str, output_dir: str, camera_index: Optional[CameraIndex]
 
 def main():
     ap = argparse.ArgumentParser(description="(_source_file, Num_event) 기반 3개(t0,+5s,+10s) 집계")
-    ap.add_argument("--input", "-i", help="�Է� CSV ���")
-    ap.add_argument("--input-dir", help="CSV ������ ������ �Է�")
+    ap.add_argument("--input", "-i", help="입력 CSV 파일 경로")
+    ap.add_argument("--input-dir", help="CSV 파일이 포함된 디렉터리 경로")
     ap.add_argument("--output-dir", "-o", default=DEFAULT_OUTPUT_DIR, help="출력 폴더")
     ap.add_argument("--cam-db", help="카메라 정보 SQLite 파일 경로")
     ap.add_argument("--cam-csv", help="카메라 정보 CSV 경로 (cam_id, speed, 좌표 포함)")
