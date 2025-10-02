@@ -14,6 +14,7 @@ import numbers
 import sqlite3
 import struct
 from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
 
 import pandas as pd
 
@@ -23,7 +24,12 @@ DEFAULT_DB_PATH = os.path.join(SCRIPT_DIR, "SQLite", "20250602.sqlite")
 DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, "input_table.csv")
 
 ALLOW_EVENTCODES = {81, 82, 83, 84, 85}
-CAMERA_SEARCH_RADIUS_M = 300.0
+CAMERA_SEARCH_RADIUS_M = 1000.0 # 1 km
+HEADING_TOLERANCE_DEG = 20.0   # 20 degrees
+ALLOWED_CAMERA_CODES = {
+    "1-130", "1-0", "1-12", "1-13", "1-2", "1-9", "1-139",
+    "7-130", "7-0", "7-9", "7-139", "48-0"
+}
 DEFAULT_CAM_TABLE = "250602"
 DEFAULT_EXTENSION_CANDIDATES = (
     "mod_spatialite",
@@ -88,6 +94,24 @@ def haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     return 2.0 * 6371000.0 * math.asin(math.sqrt(a))
 
 
+def _bearing_deg(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    theta = math.atan2(y, x)
+    bearing = (math.degrees(theta) + 360.0) % 360.0
+    return bearing
+
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    diff = abs((a - b) % 360.0)
+    if diff > 180.0:
+        diff = 360.0 - diff
+    return diff
+
+
 def _degree_buffer(lat: float) -> Tuple[float, float]:
     lat_buffer = CAMERA_SEARCH_RADIUS_M / 111320.0
     cos_lat = math.cos(math.radians(lat))
@@ -128,7 +152,7 @@ class CameraIndex:
     def __init__(self, records: List[Dict[str, Any]]):
         self._records = records
 
-    def lookup(self, lon: float, lat: float) -> Optional[Dict[str, Any]]:
+    def lookup(self, lon: float, lat: float, heading: Optional[float], *, require_heading: bool = True) -> Optional[Dict[str, Any]]:
         if not self._records:
             return None
         lat_buf, lon_buf = _degree_buffer(lat)
@@ -140,16 +164,31 @@ class CameraIndex:
             if abs(cam_lat - lat) > lat_buf or abs(cam_lon - lon) > lon_buf:
                 continue
             distance = haversine_m(lon, lat, cam_lon, cam_lat)
-            if distance <= CAMERA_SEARCH_RADIUS_M and distance < best_dist:
+            if distance > CAMERA_SEARCH_RADIUS_M:
+                continue
+
+            if require_heading:
+                if heading is None:
+                    continue
+                cam_heading = record.get("heading")
+                if cam_heading is None or _angle_diff_deg(cam_heading, heading) > HEADING_TOLERANCE_DEG:
+                    continue
+                azimuth = _bearing_deg(lon, lat, cam_lon, cam_lat)
+                if _angle_diff_deg(azimuth, heading) > HEADING_TOLERANCE_DEG:
+                    continue
+
+            if distance < best_dist:
                 best = record
                 best_dist = distance
         if best is None:
             return None
         return {
             "row_idx": best.get("row_idx"),
-            "cam_id": best["cam_id"],
-            "speed": best["speed"],
+            "cam_id": best.get("cam_id"),
+            "speed": best.get("speed"),
             "distance": best_dist,
+            "heading": best.get("heading"),
+            "code": best.get("code"),
         }
 
 
@@ -212,26 +251,30 @@ def load_camera_records_from_sqlite(db_path: str, table: str, spatialite_extensi
     conn = connect_spatialite(db_path, spatialite_extension)
     try:
         has_type = _table_has_column(conn, table, "type")
+        placeholders = ", ".join(f'"{code}"' for code in sorted(ALLOWED_CAMERA_CODES))
+        select_cols = 'idx, cam_id, speed, heading, code, ST_X(GEOMETRY), ST_Y(GEOMETRY)'
         if has_type:
-            query = (
-                f'SELECT idx, cam_id, speed, ST_X(GEOMETRY), ST_Y(GEOMETRY), type '
-                f'FROM "{table}" '
-                f'WHERE cam_id IS NOT NULL AND TRIM(cam_id) <> ""'
-            )
-        else:
-            query = (
-                f'SELECT idx, cam_id, speed, ST_X(GEOMETRY), ST_Y(GEOMETRY) '
-                f'FROM "{table}" '
-                f'WHERE cam_id IS NOT NULL AND TRIM(cam_id) <> ""'
-            )
+            select_cols += ', type'
+        query = (
+            f'SELECT {select_cols} '
+            f'FROM "{table}" '
+            'WHERE cam_id IS NOT NULL AND TRIM(cam_id) <> "" '
+        )
+        if has_type:
+            query += 'AND type = "EP" '
+        query += f'AND code IN ({placeholders})'
 
         records: List[Dict[str, Any]] = []
         for row in conn.execute(query):
             if has_type:
-                idx_value, cam_id, speed, lon, lat, cam_type = row
+                idx_value, cam_id, speed, heading, code, lon, lat, cam_type = row
+                cam_type_text = str(cam_type).upper() if cam_type else ""
             else:
-                idx_value, cam_id, speed, lon, lat = row
-                cam_type = ""
+                idx_value, cam_id, speed, heading, code, lon, lat = row
+                cam_type_text = "EP"
+
+            if cam_type_text != "EP":
+                continue
 
             lon_val = _safe_float(lon)
             lat_val = _safe_float(lat)
@@ -239,6 +282,13 @@ def load_camera_records_from_sqlite(db_path: str, table: str, spatialite_extensi
                 continue
 
             speed_val = _safe_float(speed)
+            heading_val = _safe_float(heading)
+            if heading_val is None:
+                continue
+
+            code_text = str(code).strip().upper()
+            if code_text not in ALLOWED_CAMERA_CODES:
+                continue
 
             row_idx_val: Optional[int] = None
             if isinstance(idx_value, numbers.Integral):
@@ -255,7 +305,9 @@ def load_camera_records_from_sqlite(db_path: str, table: str, spatialite_extensi
                 "speed": speed_val,
                 "longitude": lon_val,
                 "latitude": lat_val,
-                "type": str(cam_type).upper() if cam_type else "",
+                "type": cam_type_text,
+                "heading": heading_val,
+                "code": code_text,
             }
             records.append(record)
 
@@ -264,7 +316,6 @@ def load_camera_records_from_sqlite(db_path: str, table: str, spatialite_extensi
         return records
     finally:
         conn.close()
-
 
 
 def read_camera_csv(csv_path: str) -> pd.DataFrame:
@@ -284,6 +335,10 @@ def load_camera_records_from_csv(csv_path: str) -> List[Dict[str, Any]]:
     cam_id_columns = [c for c in df.columns if c.lower() == "cam_id"]
     speed_columns = [c for c in df.columns if c.lower() in {"speed", "limit_speed"}]
     type_columns = [c for c in df.columns if c.lower() == "type"]
+    heading_columns: List[str] = []
+    for name in ("cam_heading", "heading"):
+        heading_columns.extend([c for c in df.columns if c.lower() == name])
+    code_columns = [c for c in df.columns if c.lower() == "code"]
     row_idx_columns = [c for c in df.columns if c.lower() in {"row_idx", "idx", "ogc_fid"}]
 
     records_map: Dict[str, Dict[str, Any]] = {}
@@ -320,7 +375,7 @@ def load_camera_records_from_csv(csv_path: str) -> List[Dict[str, Any]]:
                         break
                     except ValueError:
                         row_idx_val = None
-        
+
         lon_lat: Optional[Tuple[float, float]] = None
         if "GEOMETRY" in df.columns and pd.notna(row["GEOMETRY"]):
             lon_lat = decode_spatialite_point(row["GEOMETRY"])
@@ -349,6 +404,27 @@ def load_camera_records_from_csv(csv_path: str) -> List[Dict[str, Any]]:
             if pd.notna(val):
                 cam_type = str(val).upper()
                 break
+        if cam_type != "EP":
+            continue
+
+        heading_val = None
+        for col in heading_columns:
+            val = row.get(col)
+            if pd.notna(val):
+                heading_val = _safe_float(val)
+                if heading_val is not None:
+                    break
+        if heading_val is None:
+            continue
+
+        code_text = ""
+        for col in code_columns:
+            val = row[col]
+            if pd.notna(val):
+                code_text = str(val).strip().upper()
+                break
+        if code_text not in ALLOWED_CAMERA_CODES:
+            continue
 
         record = {
             "row_idx": row_idx_val,
@@ -357,8 +433,10 @@ def load_camera_records_from_csv(csv_path: str) -> List[Dict[str, Any]]:
             "longitude": float(lon_lat[0]),
             "latitude": float(lon_lat[1]),
             "type": cam_type,
+            "heading": heading_val,
+            "code": code_text,
         }
-        priority = 1 if cam_type == "EP" else 0
+        priority = 1
         existing = records_map.get(cam_id)
         if existing is None or priority > existing["priority"]:
             records_map[cam_id] = {"priority": priority, "record": record}
@@ -530,9 +608,14 @@ def aggregate(df: pd.DataFrame, camera_index: Optional[CameraIndex]) -> pd.DataF
             for lookup_row in lookup_order:
                 lon_val = _safe_float(lookup_row.get("GPS_X"))
                 lat_val = _safe_float(lookup_row.get("GPS_Y"))
+                heading_val = _safe_float(lookup_row.get("GPS_Degree"))
                 if lon_val is None or lat_val is None:
                     continue
-                match = camera_index.lookup(lon_val, lat_val)
+                match = None
+                if heading_val is not None:
+                    match = camera_index.lookup(lon_val, lat_val, heading_val, require_heading=True)
+                if match is None:
+                    match = camera_index.lookup(lon_val, lat_val, heading_val, require_heading=False)
                 if match:
                     camera_id_val = match.get("cam_id", "") or ""
                     limit_speed_val = match.get("speed")
@@ -557,8 +640,8 @@ def aggregate(df: pd.DataFrame, camera_index: Optional[CameraIndex]) -> pd.DataF
             "GPS_Y": GPS_Y,
             "GPS_Degree": GPS_Degree,
             "camera_id": camera_id_val,
-            "row_idx": row_idx_val,
-            "과속속도": limit_speed_val,
+            "row_idx": row_idx_val if row_idx_val is not None else pd.NA,
+            "과속속도": limit_speed_val if limit_speed_val is not None else pd.NA,
             "t0": t0,
             "t+5s": p5,
             "t+10s": p10,
@@ -616,7 +699,8 @@ def convert(input_csv: str, output_dir: str, camera_index: Optional[CameraIndex]
 
 def main():
     ap = argparse.ArgumentParser(description="(_source_file, Num_event) 기반 3개(t0,+5s,+10s) 집계")
-    ap.add_argument("--input", "-i", required=True, help="입력 CSV 경로")
+    ap.add_argument("--input", "-i", help="�Է� CSV ���")
+    ap.add_argument("--input-dir", help="CSV ������ ������ �Է�")
     ap.add_argument("--output-dir", "-o", default=DEFAULT_OUTPUT_DIR, help="출력 폴더")
     ap.add_argument("--cam-db", help="카메라 정보 SQLite 파일 경로")
     ap.add_argument("--cam-csv", help="카메라 정보 CSV 경로 (cam_id, speed, 좌표 포함)")
@@ -624,13 +708,42 @@ def main():
     ap.add_argument("--spatialite", help="SpatiaLite 확장 모듈 경로 (DLL/SO)")
     args = ap.parse_args()
     try:
+        if args.input and args.input_dir:
+            raise ValueError('하나의 입력 방식만 선택하세요 (--input 또는 --input-dir).')
+        if not args.input and not args.input_dir:
+            raise ValueError('CSV 파일 또는 디렉터리 중 하나를 지정해야 합니다.')
+
+        input_paths: List[Path]
+        output_dir_root: Path
+        if args.input_dir:
+            dir_path = Path(args.input_dir)
+            if not dir_path.is_dir():
+                raise FileNotFoundError(f'입력 디렉터리가 존재하지 않습니다: {dir_path}')
+            input_paths = sorted(p for p in dir_path.iterdir() if p.suffix.lower() == '.csv')
+            if not input_paths:
+                raise FileNotFoundError(f'CSV 파일을 찾을 수 없습니다: {dir_path}')
+            output_dir_root = Path(DEFAULT_OUTPUT_DIR) / (dir_path.name + '_output')
+        else:
+            file_path = Path(args.input)
+            if not file_path.is_file():
+                raise FileNotFoundError(f'입력 CSV 파일을 찾을 수 없습니다: {file_path}')
+            input_paths = [file_path]
+            output_dir_root = Path(args.output_dir)
+
         camera_index, auto_message = build_camera_index(args.cam_db, args.cam_csv, args.cam_table, args.spatialite)
         if auto_message:
             print(auto_message)
-        out = convert(args.input, args.output_dir, camera_index)
-        print(f"[완료] 저장: {out}")
+
+        if args.input_dir:
+            output_dir_root.mkdir(parents=True, exist_ok=True)
+            for csv_path in input_paths:
+                out = convert(str(csv_path), str(output_dir_root), camera_index)
+                print(f'[완료] {csv_path.name} -> {out}')
+        else:
+            out = convert(str(input_paths[0]), str(output_dir_root), camera_index)
+            print(f'[완료] 저장: {out}')
     except Exception as e:
-        print(f"[실패] {e}", file=sys.stderr)
+        print(f'[실패] {e}', file=sys.stderr)
         sys.exit(1)
 
 
