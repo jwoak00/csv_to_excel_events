@@ -20,10 +20,15 @@ import pandas as pd
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "BTO_output")
 DEFAULT_DB_PATH = os.path.join(SCRIPT_DIR, "SQLite", "20250602.sqlite")
-# DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, "input_table.csv")
+DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, "input_table.csv")
 
 ALLOW_EVENTCODES = {81, 82, 83, 84, 85}
-CAMERA_SEARCH_RADIUS_M = 200.0
+CAMERA_SEARCH_RADIUS_M = 1000.0 # 1 km
+HEADING_TOLERANCE_DEG = 20.0   # 20 degrees
+ALLOWED_CAMERA_CODES = {
+    "1-130", "1-0", "1-12", "1-13", "1-2", "1-9", "1-139",
+    "7-130", "7-0", "7-9", "7-139", "48-0"
+}
 DEFAULT_CAM_TABLE = "250602"
 DEFAULT_EXTENSION_CANDIDATES = (
     "mod_spatialite",
@@ -88,6 +93,24 @@ def haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     return 2.0 * 6371000.0 * math.asin(math.sqrt(a))
 
 
+def _bearing_deg(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    theta = math.atan2(y, x)
+    bearing = (math.degrees(theta) + 360.0) % 360.0
+    return bearing
+
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    diff = abs((a - b) % 360.0)
+    if diff > 180.0:
+        diff = 360.0 - diff
+    return diff
+
+
 def _degree_buffer(lat: float) -> Tuple[float, float]:
     lat_buffer = CAMERA_SEARCH_RADIUS_M / 111320.0
     cos_lat = math.cos(math.radians(lat))
@@ -128,7 +151,7 @@ class CameraIndex:
     def __init__(self, records: List[Dict[str, Any]]):
         self._records = records
 
-    def lookup(self, lon: float, lat: float) -> Optional[Dict[str, Any]]:
+    def lookup(self, lon: float, lat: float, heading: Optional[float], *, require_heading: bool = True) -> Optional[Dict[str, Any]]:
         if not self._records:
             return None
         lat_buf, lon_buf = _degree_buffer(lat)
@@ -140,15 +163,31 @@ class CameraIndex:
             if abs(cam_lat - lat) > lat_buf or abs(cam_lon - lon) > lon_buf:
                 continue
             distance = haversine_m(lon, lat, cam_lon, cam_lat)
-            if distance <= CAMERA_SEARCH_RADIUS_M and distance < best_dist:
+            if distance > CAMERA_SEARCH_RADIUS_M:
+                continue
+
+            if require_heading:
+                if heading is None:
+                    continue
+                cam_heading = record.get("heading")
+                if cam_heading is None or _angle_diff_deg(cam_heading, heading) > HEADING_TOLERANCE_DEG:
+                    continue
+                azimuth = _bearing_deg(lon, lat, cam_lon, cam_lat)
+                if _angle_diff_deg(azimuth, heading) > HEADING_TOLERANCE_DEG:
+                    continue
+
+            if distance < best_dist:
                 best = record
                 best_dist = distance
         if best is None:
             return None
         return {
-            "cam_id": best["cam_id"],
-            "speed": best["speed"],
+            "row_idx": best.get("row_idx"),
+            "cam_id": best.get("cam_id"),
+            "speed": best.get("speed"),
             "distance": best_dist,
+            "heading": best.get("heading"),
+            "code": best.get("code"),
         }
 
 
@@ -211,26 +250,30 @@ def load_camera_records_from_sqlite(db_path: str, table: str, spatialite_extensi
     conn = connect_spatialite(db_path, spatialite_extension)
     try:
         has_type = _table_has_column(conn, table, "type")
+        placeholders = ", ".join(f'"{code}"' for code in sorted(ALLOWED_CAMERA_CODES))
+        select_cols = 'idx, cam_id, speed, heading, code, ST_X(GEOMETRY), ST_Y(GEOMETRY)'
         if has_type:
-            query = (
-                f'SELECT cam_id, speed, ST_X(GEOMETRY), ST_Y(GEOMETRY), type '
-                f'FROM "{table}" '
-                f'WHERE cam_id IS NOT NULL AND TRIM(cam_id) <> ""'
-            )
-        else:
-            query = (
-                f'SELECT cam_id, speed, ST_X(GEOMETRY), ST_Y(GEOMETRY) '
-                f'FROM "{table}" '
-                f'WHERE cam_id IS NOT NULL AND TRIM(cam_id) <> ""'
-            )
+            select_cols += ', type'
+        query = (
+            f'SELECT {select_cols} '
+            f'FROM "{table}" '
+            'WHERE cam_id IS NOT NULL AND TRIM(cam_id) <> "" '
+        )
+        if has_type:
+            query += 'AND type = "EP" '
+        query += f'AND code IN ({placeholders})'
 
         records: List[Dict[str, Any]] = []
         for row in conn.execute(query):
             if has_type:
-                cam_id, speed, lon, lat, cam_type = row
+                idx_value, cam_id, speed, heading, code, lon, lat, cam_type = row
+                cam_type_text = str(cam_type).upper() if cam_type else ""
             else:
-                cam_id, speed, lon, lat = row
-                cam_type = ""
+                idx_value, cam_id, speed, heading, code, lon, lat = row
+                cam_type_text = "EP"
+
+            if cam_type_text != "EP":
+                continue
 
             lon_val = _safe_float(lon)
             lat_val = _safe_float(lat)
@@ -238,12 +281,32 @@ def load_camera_records_from_sqlite(db_path: str, table: str, spatialite_extensi
                 continue
 
             speed_val = _safe_float(speed)
+            heading_val = _safe_float(heading)
+            if heading_val is None:
+                continue
+
+            code_text = str(code).strip().upper()
+            if code_text not in ALLOWED_CAMERA_CODES:
+                continue
+
+            row_idx_val: Optional[int] = None
+            if isinstance(idx_value, numbers.Integral):
+                row_idx_val = int(idx_value)
+            else:
+                try:
+                    row_idx_val = int(str(idx_value).strip())
+                except (TypeError, ValueError):
+                    row_idx_val = None
+
             record: Dict[str, Any] = {
+                "row_idx": row_idx_val,
                 "cam_id": str(cam_id),
                 "speed": speed_val,
                 "longitude": lon_val,
                 "latitude": lat_val,
-                "type": str(cam_type).upper() if cam_type else "",
+                "type": cam_type_text,
+                "heading": heading_val,
+                "code": code_text,
             }
             records.append(record)
 
@@ -271,6 +334,11 @@ def load_camera_records_from_csv(csv_path: str) -> List[Dict[str, Any]]:
     cam_id_columns = [c for c in df.columns if c.lower() == "cam_id"]
     speed_columns = [c for c in df.columns if c.lower() in {"speed", "limit_speed"}]
     type_columns = [c for c in df.columns if c.lower() == "type"]
+    heading_columns: List[str] = []
+    for name in ("cam_heading", "heading"):
+        heading_columns.extend([c for c in df.columns if c.lower() == name])
+    code_columns = [c for c in df.columns if c.lower() == "code"]
+    row_idx_columns = [c for c in df.columns if c.lower() in {"row_idx", "idx", "ogc_fid"}]
 
     records_map: Dict[str, Dict[str, Any]] = {}
     for _, row in df.iterrows():
@@ -286,6 +354,26 @@ def load_camera_records_from_csv(csv_path: str) -> List[Dict[str, Any]]:
         cam_id = str(cam_id_value).strip()
         if not cam_id or cam_id.lower() == "nan":
             continue
+
+        row_idx_val: Optional[int] = None
+        for col in row_idx_columns:
+            value = row.get(col, None)
+            if pd.notna(value):
+                if isinstance(value, numbers.Integral):
+                    row_idx_val = int(value)
+                    break
+                text_value = str(value).strip()
+                if not text_value:
+                    continue
+                try:
+                    row_idx_val = int(float(text_value))
+                    break
+                except ValueError:
+                    try:
+                        row_idx_val = int(text_value)
+                        break
+                    except ValueError:
+                        row_idx_val = None
 
         lon_lat: Optional[Tuple[float, float]] = None
         if "GEOMETRY" in df.columns and pd.notna(row["GEOMETRY"]):
@@ -315,15 +403,39 @@ def load_camera_records_from_csv(csv_path: str) -> List[Dict[str, Any]]:
             if pd.notna(val):
                 cam_type = str(val).upper()
                 break
+        if cam_type != "EP":
+            continue
+
+        heading_val = None
+        for col in heading_columns:
+            val = row.get(col)
+            if pd.notna(val):
+                heading_val = _safe_float(val)
+                if heading_val is not None:
+                    break
+        if heading_val is None:
+            continue
+
+        code_text = ""
+        for col in code_columns:
+            val = row[col]
+            if pd.notna(val):
+                code_text = str(val).strip().upper()
+                break
+        if code_text not in ALLOWED_CAMERA_CODES:
+            continue
 
         record = {
+            "row_idx": row_idx_val,
             "cam_id": cam_id,
             "speed": speed_val,
             "longitude": float(lon_lat[0]),
             "latitude": float(lon_lat[1]),
             "type": cam_type,
+            "heading": heading_val,
+            "code": code_text,
         }
-        priority = 1 if cam_type == "EP" else 0
+        priority = 1
         existing = records_map.get(cam_id)
         if existing is None or priority > existing["priority"]:
             records_map[cam_id] = {"priority": priority, "record": record}
@@ -331,6 +443,7 @@ def load_camera_records_from_csv(csv_path: str) -> List[Dict[str, Any]]:
     if not records_map:
         raise RuntimeError("No camera records found in CSV.")
     return [item["record"] for item in records_map.values()]
+
 
 
 def _deduplicate_camera_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -391,11 +504,11 @@ def classify_speed(
     t0: Optional[float],
     p5: Optional[float],
     p10: Optional[float],
-) -> str:
+) -> Optional[int]:
     limit = _safe_float(limit_speed)
     t0_val = _safe_float(t0)
     if limit is None or t0_val is None:
-        return ""
+        return None
     t0_over = t0_val - limit
     if t0_over < 20:
         return 0
@@ -403,7 +516,7 @@ def classify_speed(
     p5_val = _safe_float(p5)
     p10_val = _safe_float(p10)
     if p5_val is None or p10_val is None:
-        return ""
+        return None
 
     over5 = (p5_val - limit) >= 20
     over10 = (p10_val - limit) >= 20
@@ -414,7 +527,7 @@ def classify_speed(
         return 1
     if not over5 and not over10:
         return 3
-    return ""
+    return None
 
 
 def read_csv_smart(csv_path: str) -> pd.DataFrame:
@@ -480,22 +593,40 @@ def aggregate(df: pd.DataFrame, camera_index: Optional[CameraIndex]) -> pd.DataF
         month_val = month_from_digits(row0["_digits"]) if row0 is not None else None
 
         camera_id_val = ""
+        row_idx_val: Optional[int] = None
         limit_speed_val: Optional[float] = None
         if camera_index is not None and not g3.empty:
-            best_match: Optional[Dict[str, Any]] = None
-            best_distance = CAMERA_SEARCH_RADIUS_M + 1.0
-            for _, row in g3.iterrows():
-                lon_val = _safe_float(row.get("GPS_X"))
-                lat_val = _safe_float(row.get("GPS_Y"))
+            lookup_order: List[pd.Series] = []
+            if len(g3) >= 2:
+                lookup_order.append(g3.iloc[1])
+            if len(g3) >= 1:
+                lookup_order.append(g3.iloc[0])
+            if len(g3) >= 3:
+                lookup_order.append(g3.iloc[2])
+
+            for lookup_row in lookup_order:
+                lon_val = _safe_float(lookup_row.get("GPS_X"))
+                lat_val = _safe_float(lookup_row.get("GPS_Y"))
+                heading_val = _safe_float(lookup_row.get("GPS_Degree"))
                 if lon_val is None or lat_val is None:
                     continue
-                match = camera_index.lookup(lon_val, lat_val)
-                if match and match["distance"] < best_distance:
-                    best_match = match
-                    best_distance = match["distance"]
-            if best_match:
-                camera_id_val = best_match["cam_id"]
-                limit_speed_val = best_match["speed"]
+                match = None
+                if heading_val is not None:
+                    match = camera_index.lookup(lon_val, lat_val, heading_val, require_heading=True)
+                if match is None:
+                    match = camera_index.lookup(lon_val, lat_val, heading_val, require_heading=False)
+                if match:
+                    camera_id_val = match.get("cam_id", "") or ""
+                    limit_speed_val = match.get("speed")
+                    raw_idx = match.get("row_idx")
+                    if isinstance(raw_idx, numbers.Integral):
+                        row_idx_val = int(raw_idx)
+                    else:
+                        try:
+                            row_idx_val = int(str(raw_idx).strip())
+                        except (TypeError, ValueError):
+                            row_idx_val = None
+                    break
 
         classification = classify_speed(limit_speed_val, t0, p5, p10)
 
@@ -508,10 +639,11 @@ def aggregate(df: pd.DataFrame, camera_index: Optional[CameraIndex]) -> pd.DataF
             "GPS_Y": GPS_Y,
             "GPS_Degree": GPS_Degree,
             "camera_id": camera_id_val,
-            "과속속도": limit_speed_val if limit_speed_val is not None else "",
-            "t0": t0 if t0 is not None else "",
-            "t+5s": p5 if p5 is not None else "",
-            "t+10s": p10 if p10 is not None else "",
+            "row_idx": row_idx_val if row_idx_val is not None else pd.NA,
+            "과속속도": limit_speed_val if limit_speed_val is not None else pd.NA,
+            "t0": t0,
+            "t+5s": p5,
+            "t+10s": p10,
             "t0_과속속도_분류": classification,
             "_month": month_val,
         })
@@ -520,12 +652,12 @@ def aggregate(df: pd.DataFrame, camera_index: Optional[CameraIndex]) -> pd.DataF
 
     cols = [
         "Num_event", "DateTime", "eventcode",
-        "GPS_X", "GPS_Y", "GPS_Degree", "camera_id",
+        "GPS_X", "GPS_Y", "GPS_Degree", "camera_id", "row_idx",
         "과속속도", "t0", "t+5s", "t+10s", "t0_과속속도_분류", "_month", "_source_file",
     ]
     for c in cols:
         if c not in out.columns:
-            out[c] = ""
+            out[c] = pd.NA
     out = out[cols]
 
     return out
@@ -586,3 +718,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
