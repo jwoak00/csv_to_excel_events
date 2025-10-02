@@ -1,5 +1,3 @@
-검색된 코드베이스 "수정된 코드로 다시 작성", 3 결과
-
 # CSV to Excel Events Converter
 
 이벤트 데이터가 포함된 CSV 파일을 읽어 속도 카메라 정보와 매칭하여 Excel 파일로 변환하는 Python 스크립트입니다.
