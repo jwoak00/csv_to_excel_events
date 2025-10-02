@@ -699,8 +699,8 @@ def convert(input_csv: str, output_dir: str, camera_index: Optional[CameraIndex]
 
 def main():
     ap = argparse.ArgumentParser(description="(_source_file, Num_event) 기반 3개(t0,+5s,+10s) 집계")
-    ap.add_argument("--input", "-i", help="�Է� CSV ���")
-    ap.add_argument("--input-dir", help="CSV ������ ������ �Է�")
+    ap.add_argument("--input", "-i", help="입력 CSV 파일 경로")
+    ap.add_argument("--input-dir", help="CSV 파일이 포함된 디렉터리 경로")
     ap.add_argument("--output-dir", "-o", default=DEFAULT_OUTPUT_DIR, help="출력 폴더")
     ap.add_argument("--cam-db", help="카메라 정보 SQLite 파일 경로")
     ap.add_argument("--cam-csv", help="카메라 정보 CSV 경로 (cam_id, speed, 좌표 포함)")
