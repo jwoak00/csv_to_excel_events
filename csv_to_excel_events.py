@@ -138,10 +138,10 @@ def decode_spatialite_point(blob_value: Any) -> Optional[Tuple[float, float]]:
     if len(raw) < 38:
         return None
     try:
-        minx, maxx, miny, maxy = struct.unpack("<dddd", raw[6:38])
+        minx, miny, maxx, maxy = struct.unpack("<dddd", raw[6:38])
     except struct.error:
         return None
-    if any(math.isnan(v) or math.isinf(v) for v in (minx, maxx, miny, maxy)):
+    if any(math.isnan(v) or math.isinf(v) for v in (minx, miny, maxx, maxy)):
         return None
     lon = (minx + maxx) / 2.0
     lat = (miny + maxy) / 2.0
@@ -330,120 +330,129 @@ def read_camera_csv(csv_path: str) -> pd.DataFrame:
 
 def load_camera_records_from_csv(csv_path: str) -> List[Dict[str, Any]]:
     df = read_camera_csv(csv_path)
-    lon_candidates = [c for c in df.columns if c.lower() in {"longitude", "lon", "gps_x", "x"}]
-    lat_candidates = [c for c in df.columns if c.lower() in {"latitude", "lat", "gps_y", "y"}]
-    cam_id_columns = [c for c in df.columns if c.lower() == "cam_id"]
-    speed_columns = [c for c in df.columns if c.lower() in {"speed", "limit_speed"}]
-    type_columns = [c for c in df.columns if c.lower() == "type"]
-    heading_columns: List[str] = []
-    for name in ("cam_heading", "heading"):
-        heading_columns.extend([c for c in df.columns if c.lower() == name])
-    code_columns = [c for c in df.columns if c.lower() == "code"]
-    row_idx_columns = [c for c in df.columns if c.lower() in {"row_idx", "idx", "ogc_fid"}]
 
-    records_map: Dict[str, Dict[str, Any]] = {}
+    def _normalize(name: Any) -> str:
+        return str(name).strip().lower()
+
+    normalized_cols: Dict[str, str] = {}
+    for col in df.columns:
+        normalized_cols.setdefault(_normalize(col), col)
+
+    def _resolve_column(*candidates: str) -> Optional[str]:
+        for candidate in candidates:
+            key = candidate.strip().lower()
+            if key in normalized_cols:
+                return normalized_cols[key]
+        return None
+
+    def _resolve_columns(*candidates: str) -> List[str]:
+        cols: List[str] = []
+        for candidate in candidates:
+            key = candidate.strip().lower()
+            if key in normalized_cols:
+                cols.append(normalized_cols[key])
+        return cols
+
+    cam_id_col = _resolve_column("cam_id")
+    if cam_id_col is None:
+        raise RuntimeError("Camera CSV must include a cam_id column.")
+
+    code_col = _resolve_column("code")
+    if code_col is None:
+        raise RuntimeError("Camera CSV must include a code column.")
+
+    type_col = _resolve_column("type")
+    idx_col = _resolve_column("idx", "row_idx", "ogc_fid")
+    geometry_col = _resolve_column("geometry")
+    lon_col = _resolve_column("longitude", "lon", "gps_x", "x")
+    lat_col = _resolve_column("latitude", "lat", "gps_y", "y")
+    heading_cols = _resolve_columns("cam_heading", "heading")
+    speed_cols = _resolve_columns("speed", "limit_speed", "제한속도", "과속속도")
+
+    records: List[Dict[str, Any]] = []
     for _, row in df.iterrows():
-        cam_id_value = None
-        for col in cam_id_columns:
-            value = row[col]
-            if pd.notna(value):
-                cam_id_value = value
-                break
-        if cam_id_value is None:
+        raw_cam_id = row.get(cam_id_col)
+        if pd.isna(raw_cam_id):
             continue
-
-        cam_id = str(cam_id_value).strip()
+        cam_id = str(raw_cam_id).strip()
         if not cam_id or cam_id.lower() == "nan":
             continue
 
-        row_idx_val: Optional[int] = None
-        for col in row_idx_columns:
-            value = row.get(col, None)
-            if pd.notna(value):
-                if isinstance(value, numbers.Integral):
-                    row_idx_val = int(value)
-                    break
-                text_value = str(value).strip()
-                if not text_value:
-                    continue
-                try:
-                    row_idx_val = int(float(text_value))
-                    break
-                except ValueError:
-                    try:
-                        row_idx_val = int(text_value)
-                        break
-                    except ValueError:
-                        row_idx_val = None
-
-        lon_lat: Optional[Tuple[float, float]] = None
-        if "GEOMETRY" in df.columns and pd.notna(row["GEOMETRY"]):
-            lon_lat = decode_spatialite_point(row["GEOMETRY"])
-
-        if lon_lat is None and lon_candidates and lat_candidates:
-            lon_val = _safe_float(row[lon_candidates[0]])
-            lat_val = _safe_float(row[lat_candidates[0]])
-            if lon_val is not None and lat_val is not None:
-                lon_lat = (lon_val, lat_val)
-
-        if lon_lat is None:
-            continue
-
-        speed_val = None
-        for col in speed_columns:
-            val = row[col]
-            if pd.notna(val):
-                candidate_speed = _safe_float(val)
-                if candidate_speed is not None:
-                    speed_val = candidate_speed
-                    break
-
-        cam_type = ""
-        for col in type_columns:
-            val = row[col]
-            if pd.notna(val):
-                cam_type = str(val).upper()
-                break
+        cam_type = "EP"
+        if type_col:
+            type_value = row.get(type_col)
+            if pd.notna(type_value):
+                cam_type_candidate = str(type_value).strip().upper()
+                if cam_type_candidate:
+                    cam_type = cam_type_candidate
         if cam_type != "EP":
             continue
 
-        heading_val = None
-        for col in heading_columns:
-            val = row.get(col)
-            if pd.notna(val):
-                heading_val = _safe_float(val)
-                if heading_val is not None:
-                    break
+        code_value = row.get(code_col)
+        if pd.isna(code_value):
+            continue
+        code_text = str(code_value).strip().upper()
+        if code_text not in ALLOWED_CAMERA_CODES:
+            continue
+
+        lon_lat: Optional[Tuple[float, float]] = None
+        if geometry_col:
+            geom_value = row.get(geometry_col)
+            if pd.notna(geom_value):
+                lon_lat = decode_spatialite_point(geom_value)
+        if lon_lat is None and lon_col and lat_col:
+            lon_candidate = _safe_float(row.get(lon_col))
+            lat_candidate = _safe_float(row.get(lat_col))
+            if lon_candidate is not None and lat_candidate is not None:
+                lon_lat = (lon_candidate, lat_candidate)
+        if lon_lat is None:
+            continue
+        lon_val = float(lon_lat[0])
+        lat_val = float(lon_lat[1])
+
+        heading_val: Optional[float] = None
+        for col in heading_cols:
+            candidate = _safe_float(row.get(col))
+            if candidate is not None:
+                heading_val = candidate
+                break
         if heading_val is None:
             continue
 
-        code_text = ""
-        for col in code_columns:
-            val = row[col]
-            if pd.notna(val):
-                code_text = str(val).strip().upper()
+        speed_val: Optional[float] = None
+        for col in speed_cols:
+            candidate = _safe_float(row.get(col))
+            if candidate is not None:
+                speed_val = candidate
                 break
-        if code_text not in ALLOWED_CAMERA_CODES:
-            continue
+
+        row_idx_val: Optional[int] = None
+        if idx_col:
+            raw_idx = row.get(idx_col)
+            if pd.notna(raw_idx):
+                if isinstance(raw_idx, numbers.Integral):
+                    row_idx_val = int(raw_idx)
+                else:
+                    try:
+                        row_idx_val = int(str(raw_idx).strip())
+                    except (TypeError, ValueError):
+                        row_idx_val = None
 
         record = {
             "row_idx": row_idx_val,
             "cam_id": cam_id,
             "speed": speed_val,
-            "longitude": float(lon_lat[0]),
-            "latitude": float(lon_lat[1]),
+            "longitude": lon_val,
+            "latitude": lat_val,
             "type": cam_type,
             "heading": heading_val,
             "code": code_text,
         }
-        priority = 1
-        existing = records_map.get(cam_id)
-        if existing is None or priority > existing["priority"]:
-            records_map[cam_id] = {"priority": priority, "record": record}
+        records.append(record)
 
-    if not records_map:
+    if not records:
         raise RuntimeError("No camera records found in CSV.")
-    return [item["record"] for item in records_map.values()]
+    return records
 
 
 
@@ -666,19 +675,26 @@ def aggregate(df: pd.DataFrame, camera_index: Optional[CameraIndex]) -> pd.DataF
 
 def write_by_month(out_df: pd.DataFrame, xlsx_path: str):
     out_df_sorted = out_df.sort_values(by=["_source_file", "Num_event"]).copy()
-    months_present = sorted(
-        {int(m) for m in out_df_sorted["_month"] if isinstance(m, numbers.Integral)}
-    )
-    others_mask = ~out_df_sorted["_month"].apply(lambda x: isinstance(x, numbers.Integral))
-    others_df = out_df_sorted[others_mask]
+
+    def _group_name(month_value: Any) -> str:
+        if isinstance(month_value, numbers.Integral):
+            month = int(month_value)
+            if month in (6, 7):
+                return "6-7월"
+            if month in (8, 9):
+                return "8-9월"
+        return "기타"
+
+    group_labels = out_df_sorted["_month"].apply(_group_name)
+    sheet_order = ["6-7월", "8-9월", "기타"]
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        for mm in months_present:
-            sheet = f"{mm:02d}월"
-            tmp = out_df_sorted[out_df_sorted["_month"] == mm].drop(columns=["_month"])
-            tmp.to_excel(writer, sheet_name=sheet, index=False)
-        if len(others_df) > 0:
-            others_df.drop(columns=["_month"]).to_excel(writer, sheet_name="기타", index=False)
+        for sheet in sheet_order:
+            sheet_df = out_df_sorted[group_labels == sheet]
+            if sheet_df.empty:
+                continue
+            sheet_df = sheet_df.drop(columns=["_month"], errors="ignore")
+            sheet_df.to_excel(writer, sheet_name=sheet, index=False)
 
 
 def build_output_path(input_csv: str, output_dir: str) -> str:
